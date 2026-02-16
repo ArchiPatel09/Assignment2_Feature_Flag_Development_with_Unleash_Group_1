@@ -16,10 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
@@ -36,7 +36,7 @@ jobs:
           mvn clean test
 
       - name: Upload Unit Test Reports
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: unit-test-reports
           path: |
@@ -50,12 +50,12 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Install Docker Compose
+      - name: Install Docker Compose and dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y docker-compose curl jq bc
@@ -117,7 +117,7 @@ jobs:
         run: |
           chmod +x ./scripts/init-flags.sh
           ./scripts/init-flags.sh
-          sleep 5
+          sleep 10
 
       - name: Create Test Product
         run: |
@@ -133,12 +133,6 @@ jobs:
       - name: Integration Test - Premium Pricing
         run: |
           echo -e "\n🧪 Testing premium-pricing flag..."
-          
-          # Enable premium-pricing flag
-          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/premium-pricing/environments/development/on" \
-            -H "Authorization: $ADMIN_TOKEN"
-          
-          sleep 5
           
           # Get regular price
           REGULAR_PRICE=$(curl -s http://localhost:8081/api/products/$PRODUCT_ID | jq -r '.price')
@@ -158,18 +152,13 @@ jobs:
             echo "✅ premium-pricing flag is working (10% discount applied)"
           else
             echo "❌ premium-pricing flag test failed"
+            echo "Expected: $EXPECTED_PRICE, Got: $PREMIUM_PRICE"
             exit 1
           fi
 
       - name: Integration Test - Bulk Order Discount
         run: |
           echo -e "\n🧪 Testing bulk-order-discount flag..."
-          
-          # Enable bulk-order-discount flag
-          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/bulk-order-discount/environments/development/on" \
-            -H "Authorization: $ADMIN_TOKEN"
-          
-          sleep 5
           
           # Get product price
           REGULAR_PRICE=$(curl -s http://localhost:8081/api/products/$PRODUCT_ID | jq -r '.price')
@@ -192,18 +181,13 @@ jobs:
             echo "✅ bulk-order-discount flag is working (15% discount applied)"
           else
             echo "❌ bulk-order-discount flag test failed"
+            echo "Expected: $EXPECTED_PRICE, Got: $BULK_ORDER_TOTAL"
             exit 1
           fi
 
       - name: Integration Test - Order Notifications
         run: |
           echo -e "\n🧪 Testing order-notifications flag..."
-          
-          # Enable order-notifications flag
-          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/order-notifications/environments/development/on" \
-            -H "Authorization: $ADMIN_TOKEN"
-          
-          sleep 5
           
           # Clear logs
           docker logs order-service > /dev/null 2>&1 || true
@@ -229,6 +213,40 @@ jobs:
             exit 1
           fi
 
+      - name: Test Flag Toggle Behavior
+        run: |
+          echo -e "\n🧪 Testing flag toggle behavior..."
+          
+          # Get current premium price
+          PREMIUM_BEFORE=$(curl -s http://localhost:8081/api/products/premium | jq -r ".[] | select(.id == $PRODUCT_ID) | .price")
+          echo "Premium price before disabling: $PREMIUM_BEFORE"
+          
+          # Disable premium-pricing flag
+          echo "Disabling premium-pricing flag..."
+          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/premium-pricing/environments/development/off" \
+            -H "Authorization: $ADMIN_TOKEN"
+          
+          # Wait for flag to propagate
+          sleep 15
+          
+          # Get premium price after disabling
+          PREMIUM_AFTER=$(curl -s http://localhost:8081/api/products/premium | jq -r ".[] | select(.id == $PRODUCT_ID) | .price")
+          REGULAR_PRICE=$(curl -s http://localhost:8081/api/products/$PRODUCT_ID | jq -r '.price')
+          
+          echo "Regular price: $REGULAR_PRICE"
+          echo "Premium price after disabling: $PREMIUM_AFTER"
+          
+          # Check if premium price equals regular price (no discount)
+          DIFF=$(echo "$PREMIUM_AFTER - $REGULAR_PRICE" | bc)
+          ABS_DIFF=$(echo "${DIFF#-}")
+          
+          if (( $(echo "$ABS_DIFF < 0.01" | bc -l) )); then
+            echo "✅ Flag toggle is working (discount removed after disabling)"
+          else
+            echo "❌ Flag toggle test failed - Price didn't return to regular"
+            exit 1
+          fi
+
       - name: Show Docker Logs
         if: always()
         run: |
@@ -238,6 +256,15 @@ jobs:
           docker logs product-service --tail 30
           echo -e "\n=== Order Service Logs ==="
           docker logs order-service --tail 30
+
+      - name: Upload Integration Test Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs
+          path: |
+            docker-compose-logs.txt
+          if-no-files-found: ignore
 
       - name: Tear down Docker Stack
         if: always()
@@ -250,7 +277,12 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq docker-compose
 
       - name: Start Unleash and PostgreSQL
         run: |
@@ -259,11 +291,13 @@ jobs:
 
       - name: Wait for Unleash
         run: |
+          echo "Waiting for Unleash to be ready..."
           for i in {1..30}; do
             if curl -s http://localhost:4242/health > /dev/null; then
               echo "✅ Unleash is ready"
               break
             fi
+            echo "⏳ Waiting for Unleash... ($i/30)"
             sleep 5
           done
 
@@ -287,29 +321,6 @@ jobs:
               exit 1
             fi
           done
-
-      - name: Test Flag Toggle Behavior
-        run: |
-          echo "🔍 Testing flag toggle behavior..."
-          
-          # Disable a flag
-          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/premium-pricing/environments/development/off" \
-            -H "Authorization: $ADMIN_TOKEN"
-          
-          sleep 5
-          
-          # Verify it's disabled
-          FLAG_STATUS=$(curl -s -H "Authorization: $ADMIN_TOKEN" \
-            http://localhost:4242/api/admin/projects/default/features/premium-pricing)
-          
-          IS_ENABLED=$(echo "$FLAG_STATUS" | jq -r '.environments[] | select(.name=="development") | .enabled')
-          
-          if [ "$IS_ENABLED" = "false" ]; then
-            echo "✅ Flag toggle working - flag successfully disabled"
-          else
-            echo "❌ Flag toggle test failed"
-            exit 1
-          fi
 
       - name: Cleanup
         if: always()
