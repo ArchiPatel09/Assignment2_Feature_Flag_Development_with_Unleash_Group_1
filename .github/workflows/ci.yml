@@ -91,20 +91,25 @@ jobs:
         run: |
           docker-compose up -d
 
-          # Restart order-service with correct environment
+          # Stop the compose-created order-service
           docker stop order-service
           docker rm order-service
 
+          # Find compose network name dynamically
+          NETWORK=$(docker network ls --format "{{.Name}}" | grep _ecommerce-network)
+
+          # Run order-service manually with proper env
           docker run -d \
             --name order-service \
-            --network $(docker network ls --filter name=_default --format "{{.Name}}") \
+            --network $NETWORK \
             -e SPRING_PROFILES_ACTIVE=docker \
             -e PRODUCT_SERVICE_URL=http://product-service:8081 \
             -e UNLEASH_API_URL=http://unleash-server:4242/api \
             order-service
 
-          docker-compose ps
-
+          docker ps
+      
+      
 
       - name: Wait for services to be healthy
         run: |
