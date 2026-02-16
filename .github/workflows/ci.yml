@@ -7,7 +7,8 @@ on:
   pull_request:
 
 env:
-  ADMIN_TOKEN: unleash4all
+  ADMIN_TOKEN: "*:*.unleash-default-token"
+  UNLEASH_API_URL: "http://localhost:4242/api"
 
 jobs:
   build-and-test:
@@ -20,20 +21,19 @@ jobs:
       - name: Set up JDK 21
         uses: actions/setup-java@v3
         with:
-          distribution: temurin
-          java-version: 21
+          distribution: 'temurin'
+          java-version: '21'
+          cache: maven
 
       - name: Build Product Service
         run: |
           cd product-service
           mvn clean test
-        continue-on-error: false
 
       - name: Build Order Service
         run: |
           cd order-service
           mvn clean test
-        continue-on-error: false
 
       - name: Upload Unit Test Reports
         uses: actions/upload-artifact@v3
@@ -47,124 +47,270 @@ jobs:
     name: Docker Build & Integration Test
     runs-on: ubuntu-latest
     needs: build-and-test
-    services:
-      docker:
-        image: docker:24-dind
-        privileged: true
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Set up Docker Compose
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Install Docker Compose
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker-compose curl jq bc
 
       - name: Build and Start Docker Stack
         run: |
           docker-compose -f docker-compose.yml up -d --build
+          docker-compose ps
 
       - name: Wait for PostgreSQL
         run: |
-          until docker exec unleash-postgres pg_isready -U unleash_user; do
-            echo "Waiting for Postgres..."
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if docker exec unleash-postgres pg_isready -U unleash_user > /dev/null 2>&1; then
+              echo "✅ PostgreSQL is ready"
+              break
+            fi
+            echo "⏳ Waiting for PostgreSQL... ($i/30)"
             sleep 5
           done
 
       - name: Wait for Unleash Server
         run: |
-          until curl -s http://localhost:4242/health; do
-            echo "Waiting for Unleash..."
+          echo "Waiting for Unleash to be ready..."
+          for i in {1..30}; do
+            if curl -s http://localhost:4242/health > /dev/null; then
+              echo "✅ Unleash is ready"
+              break
+            fi
+            echo "⏳ Waiting for Unleash... ($i/30)"
             sleep 5
           done
 
       - name: Wait for Product Service
         run: |
-          until curl -s http://localhost:8081/actuator/health; do
-            echo "Waiting for Product Service..."
+          echo "Waiting for Product Service to be ready..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8081/actuator/health | grep -q "UP"; then
+              echo "✅ Product Service is ready"
+              break
+            fi
+            echo "⏳ Waiting for Product Service... ($i/30)"
             sleep 5
           done
 
       - name: Wait for Order Service
         run: |
-          until curl -s http://localhost:8082/actuator/health; do
-            echo "Waiting for Order Service..."
+          echo "Waiting for Order Service to be ready..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8082/actuator/health | grep -q "UP"; then
+              echo "✅ Order Service is ready"
+              break
+            fi
+            echo "⏳ Waiting for Order Service... ($i/30)"
             sleep 5
           done
 
       - name: Initialize Feature Flags
         run: |
-          bash ./scripts/init-flags.sh
+          chmod +x ./scripts/init-flags.sh
+          ./scripts/init-flags.sh
+          sleep 5
+
+      - name: Create Test Product
+        run: |
+          echo "📦 Creating test product..."
+          PRODUCT_RESPONSE=$(curl -s -X POST http://localhost:8081/api/products \
+            -H "Content-Type: application/json" \
+            -d '{"name": "Test Laptop", "price": 1000.00, "quantity": 100}')
+          
+          echo "Product Response: $PRODUCT_RESPONSE"
+          PRODUCT_ID=$(echo $PRODUCT_RESPONSE | jq -r '.id')
+          echo "PRODUCT_ID=$PRODUCT_ID" >> $GITHUB_ENV
 
       - name: Integration Test - Premium Pricing
         run: |
-          # Turn ON premium-pricing flag
-          curl -X POST "http://localhost:4242/api/admin/projects/default/features/premium-pricing/environments/development/on" \
-            -H "Authorization: Bearer $ADMIN_TOKEN"
-          # Test endpoint
-          RESPONSE=$(curl -s http://localhost:8081/api/products/premium)
-          echo "Premium Products Response: $RESPONSE"
-          if [[ "$RESPONSE" != *"discount"* ]]; then
-            echo "Premium pricing feature flag test failed"
-            exit 1
-          fi
-
-      - name: Integration Test - Order Notifications
-        run: |
-          # Turn ON order-notifications flag
-          curl -X POST "http://localhost:4242/api/admin/projects/default/features/order-notifications/environments/development/on" \
-            -H "Authorization: Bearer $ADMIN_TOKEN"
-          # Create order and check logs
-          ORDER_ID=$(curl -s -X POST http://localhost:8082/api/orders \
-            -H "Content-Type: application/json" \
-            -d '{"productId":1,"quantity":1}' | jq -r '.id')
-          LOG_OUTPUT=$(docker logs order-service)
-          echo "Order Service Logs: $LOG_OUTPUT"
-          if [[ "$LOG_OUTPUT" != *"$ORDER_ID"* ]]; then
-            echo "Order notification feature flag test failed"
+          echo -e "\n🧪 Testing premium-pricing flag..."
+          
+          # Enable premium-pricing flag
+          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/premium-pricing/environments/development/on" \
+            -H "Authorization: $ADMIN_TOKEN"
+          
+          sleep 5
+          
+          # Get regular price
+          REGULAR_PRICE=$(curl -s http://localhost:8081/api/products/$PRODUCT_ID | jq -r '.price')
+          echo "Regular price: $REGULAR_PRICE"
+          
+          # Get premium price
+          PREMIUM_RESPONSE=$(curl -s http://localhost:8081/api/products/premium)
+          PREMIUM_PRICE=$(echo "$PREMIUM_RESPONSE" | jq -r ".[] | select(.id == $PRODUCT_ID) | .price")
+          echo "Premium price: $PREMIUM_PRICE"
+          
+          # Check if discount applied (10% discount)
+          EXPECTED_PRICE=$(echo "$REGULAR_PRICE * 0.9" | bc)
+          DIFF=$(echo "$PREMIUM_PRICE - $EXPECTED_PRICE" | bc)
+          ABS_DIFF=$(echo "${DIFF#-}")
+          
+          if (( $(echo "$ABS_DIFF < 0.01" | bc -l) )); then
+            echo "✅ premium-pricing flag is working (10% discount applied)"
+          else
+            echo "❌ premium-pricing flag test failed"
             exit 1
           fi
 
       - name: Integration Test - Bulk Order Discount
         run: |
-          # Turn ON bulk-order-discount flag
-          curl -X POST "http://localhost:4242/api/admin/projects/default/features/bulk-order-discount/environments/development/on" \
-            -H "Authorization: Bearer $ADMIN_TOKEN"
-          # Create bulk order
-          RESPONSE=$(curl -s -X POST http://localhost:8082/api/orders \
+          echo -e "\n🧪 Testing bulk-order-discount flag..."
+          
+          # Enable bulk-order-discount flag
+          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/bulk-order-discount/environments/development/on" \
+            -H "Authorization: $ADMIN_TOKEN"
+          
+          sleep 5
+          
+          # Get product price
+          REGULAR_PRICE=$(curl -s http://localhost:8081/api/products/$PRODUCT_ID | jq -r '.price')
+          echo "Product price: $REGULAR_PRICE"
+          
+          # Create bulk order (quantity 10 should get 15% discount)
+          BULK_ORDER_RESPONSE=$(curl -s -X POST http://localhost:8082/api/orders \
             -H "Content-Type: application/json" \
-            -d '{"productId":1,"quantity":6}' )
-          TOTAL=$(echo "$RESPONSE" | jq '.totalPrice')
-          echo "Bulk Order Total: $TOTAL"
-          if (( $(echo "$TOTAL >= 1" | bc -l) )); then
-            echo "Bulk order discount test passed (verify manually in service)"
+            -d "{\"productId\": $PRODUCT_ID, \"quantity\": 10, \"status\": \"PENDING\"}")
+          
+          echo "Bulk Order Response: $BULK_ORDER_RESPONSE"
+          BULK_ORDER_TOTAL=$(echo "$BULK_ORDER_RESPONSE" | jq -r '.totalPrice')
+          
+          # Calculate expected price with 15% discount
+          EXPECTED_PRICE=$(echo "$REGULAR_PRICE * 10 * 0.85" | bc)
+          DIFF=$(echo "$BULK_ORDER_TOTAL - $EXPECTED_PRICE" | bc)
+          ABS_DIFF=$(echo "${DIFF#-}")
+          
+          if (( $(echo "$ABS_DIFF < 0.01" | bc -l) )); then
+            echo "✅ bulk-order-discount flag is working (15% discount applied)"
+          else
+            echo "❌ bulk-order-discount flag test failed"
+            exit 1
           fi
 
+      - name: Integration Test - Order Notifications
+        run: |
+          echo -e "\n🧪 Testing order-notifications flag..."
+          
+          # Enable order-notifications flag
+          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/order-notifications/environments/development/on" \
+            -H "Authorization: $ADMIN_TOKEN"
+          
+          sleep 5
+          
+          # Clear logs
+          docker logs order-service > /dev/null 2>&1 || true
+          
+          # Create order
+          ORDER_RESPONSE=$(curl -s -X POST http://localhost:8082/api/orders \
+            -H "Content-Type: application/json" \
+            -d "{\"productId\": $PRODUCT_ID, \"quantity\": 2, \"status\": \"PENDING\"}")
+          
+          echo "Order Response: $ORDER_RESPONSE"
+          ORDER_ID=$(echo "$ORDER_RESPONSE" | jq -r '.id')
+          
+          sleep 3
+          
+          # Check logs for notification
+          LOGS=$(docker logs order-service 2>&1)
+          if echo "$LOGS" | grep -q "ORDER NOTIFICATION.*$ORDER_ID"; then
+            echo "✅ order-notifications flag is working (notification logged)"
+          else
+            echo "❌ order-notifications flag test failed"
+            echo "Recent logs:"
+            echo "$LOGS" | tail -20
+            exit 1
+          fi
+
+      - name: Show Docker Logs
+        if: always()
+        run: |
+          echo "=== Docker Container Status ==="
+          docker-compose ps
+          echo -e "\n=== Product Service Logs ==="
+          docker logs product-service --tail 30
+          echo -e "\n=== Order Service Logs ==="
+          docker logs order-service --tail 30
+
       - name: Tear down Docker Stack
+        if: always()
         run: docker-compose -f docker-compose.yml down --volumes
 
   feature-flag-validation:
     name: Feature Flag Validation
     runs-on: ubuntu-latest
     needs: docker-build-and-integration
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
 
+      - name: Start Unleash and PostgreSQL
+        run: |
+          docker-compose -f docker-compose.yml up -d postgres unleash-server
+          sleep 15
+
+      - name: Wait for Unleash
+        run: |
+          for i in {1..30}; do
+            if curl -s http://localhost:4242/health > /dev/null; then
+              echo "✅ Unleash is ready"
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Initialize Feature Flags
+        run: |
+          chmod +x ./scripts/init-flags.sh
+          ./scripts/init-flags.sh
+          sleep 5
+
       - name: Verify Feature Flags Exist
         run: |
-          FLAGS=$(curl -s http://localhost:4242/api/admin/projects/default/features \
-            -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.features[].name')
-          echo "Existing Flags: $FLAGS"
+          echo "🔍 Verifying feature flags exist..."
+          FLAGS=$(curl -s -H "Authorization: $ADMIN_TOKEN" \
+            http://localhost:4242/api/admin/projects/default/features)
+          
           for flag in premium-pricing order-notifications bulk-order-discount; do
-            if ! echo "$FLAGS" | grep -q "$flag"; then
-              echo "Flag $flag does not exist!"
+            if echo "$FLAGS" | jq -e ".features[] | select(.name == \"$flag\")" > /dev/null; then
+              echo "✅ $flag exists"
+            else
+              echo "❌ $flag does not exist!"
               exit 1
             fi
           done
 
-      - name: Test Fallback Behavior
+      - name: Test Flag Toggle Behavior
         run: |
-          # Simulate non-existing flag
-          RESPONSE=$(curl -s http://localhost:8081/api/products/premium)
-          echo "Fallback Response: $RESPONSE"
-          # Check the application returns default behavior
+          echo "🔍 Testing flag toggle behavior..."
+          
+          # Disable a flag
+          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/premium-pricing/environments/development/off" \
+            -H "Authorization: $ADMIN_TOKEN"
+          
+          sleep 5
+          
+          # Verify it's disabled
+          FLAG_STATUS=$(curl -s -H "Authorization: $ADMIN_TOKEN" \
+            http://localhost:4242/api/admin/projects/default/features/premium-pricing)
+          
+          IS_ENABLED=$(echo "$FLAG_STATUS" | jq -r '.environments[] | select(.name=="development") | .enabled')
+          
+          if [ "$IS_ENABLED" = "false" ]; then
+            echo "✅ Flag toggle working - flag successfully disabled"
+          else
+            echo "❌ Flag toggle test failed"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: docker-compose -f docker-compose.yml down --volumes
