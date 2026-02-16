@@ -126,12 +126,6 @@ jobs:
           echo "PRODUCT_IP=$PRODUCT_IP" >> $GITHUB_ENV
           echo "Product Service IP: $PRODUCT_IP"
 
-      - name: Update Order Service Hosts File
-        run: |
-          echo "Adding product-service entry to order service hosts file..."
-          docker exec order-service sh -c "echo '${{ env.PRODUCT_IP }} product-service' >> /etc/hosts"
-          docker exec order-service cat /etc/hosts
-
       - name: Create Test Product
         run: |
           echo "📦 Creating test product..."
@@ -177,11 +171,30 @@ jobs:
           REGULAR_PRICE=$(curl -s http://localhost:8081/api/products/$PRODUCT_ID | jq -r '.price')
           echo "Product price: $REGULAR_PRICE"
           
-          # First, test direct connectivity from order container to product container
-          echo "Testing direct connectivity from order container to product container..."
-          docker exec order-service curl -s http://product-service:8081/api/products/$PRODUCT_ID || true
+          # Workaround: Since the Feign client is hardcoded to localhost:8081,
+          # we need to make localhost in the order container point to the product service
+          # We'll do this by running a socat proxy inside the order container
           
-          # Create bulk order - using the IP directly since the Feign client is hardcoded to localhost
+          echo "Setting up port forwarding in order container..."
+          # Install socat in the order container
+          docker exec order-service sh -c "apt-get update && apt-get install -y socat"
+          
+          # Kill any existing socat processes
+          docker exec order-service sh -c "pkill socat || true"
+          
+          # Set up socat to forward localhost:8081 to product-service:8081
+          docker exec -d order-service sh -c "socat TCP-LISTEN:8081,fork,reuseaddr TCP:product-service:8081"
+          
+          echo "Port forwarding established - localhost:8081 in order container now points to product-service"
+          
+          # Wait for socat to start
+          sleep 3
+          
+          # Test the forwarding
+          echo "Testing port forwarding:"
+          docker exec order-service curl -s http://localhost:8081/api/products/$PRODUCT_ID || echo "Port forwarding test failed"
+          
+          # Create bulk order - now localhost:8081 should work
           echo "Creating bulk order with quantity 10..."
           BULK_ORDER_RESPONSE=$(docker exec order-service curl -s -X POST http://localhost:8082/api/orders \
             -H "Content-Type: application/json" \
@@ -207,10 +220,6 @@ jobs:
           else
             echo "❌ Invalid JSON response"
             echo "Raw response: $BULK_ORDER_RESPONSE"
-          
-            # Check what's happening inside the order container
-            echo "Checking if product is accessible from order container:"
-            docker exec order-service curl -v http://${{ env.PRODUCT_IP }}:8081/api/products/$PRODUCT_ID || true
           
             # Check order service logs
             echo "Order service logs:"
@@ -258,8 +267,6 @@ jobs:
         run: |
           echo "=== Docker Container Status ==="
           docker-compose ps
-          echo -e "\n=== Docker Networks ==="
-          docker network inspect ecommerce-network || true
           echo -e "\n=== Product Service Logs ==="
           docker logs product-service --tail 50
           echo -e "\n=== Order Service Logs ==="
