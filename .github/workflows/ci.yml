@@ -87,14 +87,24 @@ jobs:
       - name: Build Docker images
         run: docker-compose build --no-cache
 
-      # 🔥🔥🔥 THIS IS THE IMPORTANT FIX 🔥🔥🔥
       - name: Start services
         run: |
-          export PRODUCT_SERVICE_URL=http://product-service:8081
-          export UNLEASH_API_URL=http://unleash-server:4242/api
-
           docker-compose up -d
+
+          # Restart order-service with correct environment
+          docker stop order-service
+          docker rm order-service
+
+          docker run -d \
+            --name order-service \
+            --network $(docker network ls --filter name=_default --format "{{.Name}}") \
+            -e SPRING_PROFILES_ACTIVE=docker \
+            -e PRODUCT_SERVICE_URL=http://product-service:8081 \
+            -e UNLEASH_API_URL=http://unleash-server:4242/api \
+            order-service
+
           docker-compose ps
+
 
       - name: Wait for services to be healthy
         run: |
