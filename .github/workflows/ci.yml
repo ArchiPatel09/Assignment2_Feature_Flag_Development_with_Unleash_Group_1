@@ -97,33 +97,62 @@ jobs:
           docker-compose up -d
           docker-compose ps
 
-      - name: Wait for services to be healthy
+      - name: Wait for services to be healthy with better timeout
         run: |
           echo "Waiting for services to be healthy..."
-          sleep 20
           
-          # Check each service health
-          for service in unleash-postgres unleash-server product-service order-service; do
+          # Function to check service health
+          check_service_health() {
+            local service=$1
+            local max_attempts=$2
+            local attempt=1
+          
             echo "Checking $service..."
-            max_attempts=30
-            for i in $(seq 1 $max_attempts); do
+            while [ $attempt -le $max_attempts ]; do
               if docker inspect --format='{{.State.Health.Status}}' $service 2>/dev/null | grep -q "healthy"; then
-                echo "✅ $service is healthy"
-                break
+                echo "✅ $service is healthy (attempt $attempt)"
+                return 0
               fi
-              if [ $i -eq $max_attempts ]; then
-                echo "❌ $service failed to become healthy"
-                docker logs $service
-                exit 1
-              fi
-              echo "Waiting for $service to be healthy... ($i/$max_attempts)"
-              sleep 5
-            done
-          done
           
-          # Additional wait for Unleash to fully initialize
-          echo "Waiting for Unleash API to be ready..."
-          sleep 10
+              # Check if container is running but health check not yet started
+              if docker inspect --format='{{.State.Status}}' $service 2>/dev/null | grep -q "running"; then
+                echo "⏳ $service is running but health check not yet complete (attempt $attempt/$max_attempts)"
+              else
+                echo "⏳ $service status: $(docker inspect --format='{{.State.Status}}' $service 2>/dev/null || echo 'unknown')"
+              fi
+          
+              # Show recent logs for debugging
+              if [ $((attempt % 5)) -eq 0 ]; then
+                echo "Recent logs for $service:"
+                docker logs --tail 10 $service 2>/dev/null || true
+              fi
+          
+              sleep 10
+              attempt=$((attempt + 1))
+            done
+          
+            echo "❌ $service failed to become healthy after $max_attempts attempts"
+            docker logs $service
+            return 1
+          }
+          
+          # Wait for PostgreSQL (10 attempts)
+          check_service_health "unleash-postgres" 15 || exit 1
+          
+          # Wait for Unleash (15 attempts)
+          check_service_health "unleash-server" 20 || exit 1
+          
+          # Additional wait for Unleash API to be fully ready
+          echo "Waiting for Unleash API to be fully ready..."
+          sleep 15
+          
+          # Wait for Product Service (20 attempts)
+          check_service_health "product-service" 25 || exit 1
+          
+          # Wait for Order Service (25 attempts)
+          check_service_health "order-service" 30 || exit 1
+          
+          echo "✅ All services are healthy!"
 
       - name: Initialize feature flags
         run: |
