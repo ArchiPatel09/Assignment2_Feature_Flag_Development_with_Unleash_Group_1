@@ -88,24 +88,12 @@ jobs:
         run: docker-compose build --no-cache
 
       # 🔥🔥🔥 THIS IS THE IMPORTANT FIX 🔥🔥🔥
-      - name: Start services (Override Spring config for Docker)
+      - name: Start services
         run: |
-          docker-compose up -d
-          
-          # Inject runtime overrides into order-service
-          docker exec order-service sh -c '
-          export SPRING_APPLICATION_JSON="{
-            \"product\": {
-              \"service\": {
-                \"url\": \"http://product-service:8081\"
-              }
-            },
-            \"unleash\": {
-              \"api-url\": \"http://unleash-server:4242/api\"
-            }
-          }"
-          '
+          export PRODUCT_SERVICE_URL=http://product-service:8081
+          export UNLEASH_API_URL=http://unleash-server:4242/api
 
+          docker-compose up -d
           docker-compose ps
 
       - name: Wait for services to be healthy
