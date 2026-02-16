@@ -58,7 +58,7 @@ jobs:
       - name: Install Docker Compose and dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y docker-compose curl jq bc
+          sudo apt-get install -y docker-compose curl jq
 
       - name: Build and Start Docker Stack
         run: |
@@ -81,13 +81,20 @@ jobs:
         run: |
           echo "Waiting for Unleash to be ready..."
           for i in {1..30}; do
-            if curl -s http://localhost:4242/health > /dev/null; then
+            HEALTH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4242/health)
+            if [ "$HEALTH_CHECK" = "200" ]; then
               echo "✅ Unleash is ready"
               break
             fi
-            echo "⏳ Waiting for Unleash... ($i/30)"
+            echo "⏳ Waiting for Unleash... ($i/30) - HTTP $HEALTH_CHECK"
             sleep 5
           done
+
+      - name: Initialize Feature Flags
+        run: |
+          chmod +x ./scripts/init-flags.sh
+          ./scripts/init-flags.sh
+          sleep 10
 
       - name: Wait for Product Service
         run: |
@@ -113,12 +120,6 @@ jobs:
             sleep 5
           done
 
-      - name: Initialize Feature Flags
-        run: |
-          chmod +x ./scripts/init-flags.sh
-          ./scripts/init-flags.sh
-          sleep 10
-
       - name: Create Test Product
         run: |
           echo "📦 Creating test product..."
@@ -129,25 +130,6 @@ jobs:
           echo "Product Response: $PRODUCT_RESPONSE"
           PRODUCT_ID=$(echo $PRODUCT_RESPONSE | jq -r '.id')
           echo "PRODUCT_ID=$PRODUCT_ID" >> $GITHUB_ENV
-
-      - name: Fix Network Connectivity
-        run: |
-          echo "🔧 Fixing network connectivity between services..."
-          
-          # Get the product service container IP
-          PRODUCT_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' product-service)
-          echo "Product service IP: $PRODUCT_IP"
-          
-          # Add host entry to order service container
-          docker exec order-service sh -c "echo '$PRODUCT_IP product-service' >> /etc/hosts"
-          
-          # Verify connectivity
-          echo "Verifying connectivity:"
-          docker exec order-service curl -s http://product-service:8081/api/products || echo "Still cannot connect"
-          
-          # Also try with IP directly
-          echo "Trying with IP directly:"
-          docker exec order-service curl -s http://$PRODUCT_IP:8081/api/products || echo "IP connection failed"
 
       - name: Test premium-pricing flag
         run: |
@@ -163,15 +145,11 @@ jobs:
           echo "Premium price: $PREMIUM_PRICE"
           
           # Check if discount applied (10% discount)
-          EXPECTED_PRICE=$(echo "$REGULAR_PRICE * 0.9" | bc)
-          DIFF=$(echo "$PREMIUM_PRICE - $EXPECTED_PRICE" | bc)
-          ABS_DIFF=$(echo "${DIFF#-}")
-          
-          if (( $(echo "$ABS_DIFF < 0.01" | bc -l) )); then
+          if (( $(echo "$PREMIUM_PRICE == $REGULAR_PRICE * 0.9" | bc -l) )); then
             echo "✅ premium-pricing flag is working (10% discount applied)"
           else
             echo "❌ premium-pricing flag test failed"
-            echo "Expected: $EXPECTED_PRICE, Got: $PREMIUM_PRICE"
+            echo "Expected: $(echo "$REGULAR_PRICE * 0.9" | bc), Got: $PREMIUM_PRICE"
             exit 1
           fi
 
@@ -179,35 +157,24 @@ jobs:
         run: |
           echo -e "\n🧪 Testing bulk-order-discount flag..."
           
-          # Get product price from host
+          # Get product price
           REGULAR_PRICE=$(curl -s http://localhost:8081/api/products/$PRODUCT_ID | jq -r '.price')
           echo "Product price: $REGULAR_PRICE"
           
-          # Try to create order - but first, let's test if order service can reach product service
-          echo "Testing order service to product service connectivity:"
-          docker exec order-service curl -v http://product-service:8081/api/products/$PRODUCT_ID || true
-          
-          # Create bulk order using the container's internal network
-          echo "Creating bulk order with quantity 10..."
-          
-          # Use the container's internal network by curling from within the container
-          # This bypasses any host networking issues
-          BULK_ORDER_RESPONSE=$(docker exec order-service curl -s -X POST http://localhost:8082/api/orders \
+          # Create bulk order
+          BULK_ORDER_RESPONSE=$(curl -s -X POST http://localhost:8082/api/orders \
             -H "Content-Type: application/json" \
             -d "{\"productId\": $PRODUCT_ID, \"quantity\": 10, \"status\": \"PENDING\"}")
           
           echo "Bulk Order Response: $BULK_ORDER_RESPONSE"
           
-          # Extract total price
           if echo "$BULK_ORDER_RESPONSE" | jq . >/dev/null 2>&1; then
             BULK_ORDER_TOTAL=$(echo "$BULK_ORDER_RESPONSE" | jq -r '.totalPrice')
           
             # Calculate expected price with 15% discount
             EXPECTED_PRICE=$(echo "$REGULAR_PRICE * 10 * 0.85" | bc)
-            DIFF=$(echo "$BULK_ORDER_TOTAL - $EXPECTED_PRICE" | bc)
-            ABS_DIFF=$(echo "${DIFF#-}")
           
-            if (( $(echo "$ABS_DIFF < 0.01" | bc -l) )); then
+            if (( $(echo "$BULK_ORDER_TOTAL == $EXPECTED_PRICE" | bc -l) )); then
               echo "✅ bulk-order-discount flag is working (15% discount applied)"
             else
               echo "❌ bulk-order-discount flag test failed"
@@ -231,8 +198,8 @@ jobs:
           # Clear logs
           docker logs order-service > /dev/null 2>&1 || true
           
-          # Create order using docker exec to ensure internal network
-          ORDER_RESPONSE=$(docker exec order-service curl -s -X POST http://localhost:8082/api/orders \
+          # Create order
+          ORDER_RESPONSE=$(curl -s -X POST http://localhost:8082/api/orders \
             -H "Content-Type: application/json" \
             -d "{\"productId\": $PRODUCT_ID, \"quantity\": 2, \"status\": \"PENDING\"}")
           
@@ -252,6 +219,27 @@ jobs:
             exit 1
           fi
 
+      - name: Test Flag Toggle Behavior
+        run: |
+          echo -e "\n🧪 Testing flag toggle behavior..."
+          
+          # Disable premium-pricing flag
+          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/premium-pricing/environments/development/off" \
+            -H "Authorization: $ADMIN_TOKEN"
+          
+          sleep 5
+          
+          # Check if discount is no longer applied
+          REGULAR_PRICE=$(curl -s http://localhost:8081/api/products/$PRODUCT_ID | jq -r '.price')
+          PREMIUM_PRICE=$(curl -s http://localhost:8081/api/products/premium | jq -r ".[] | select(.id == $PRODUCT_ID) | .price")
+          
+          if (( $(echo "$PREMIUM_PRICE == $REGULAR_PRICE" | bc -l) )); then
+            echo "✅ Flag toggle works - discount removed when flag OFF"
+          else
+            echo "❌ Flag toggle test failed"
+            exit 1
+          fi
+
       - name: Show Docker Logs
         if: always()
         run: |
@@ -261,7 +249,54 @@ jobs:
           docker logs product-service --tail 30
           echo -e "\n=== Order Service Logs ==="
           docker logs order-service --tail 30
+          echo -e "\n=== Unleash Server Logs ==="
+          docker logs unleash-server --tail 30
 
       - name: Tear down Docker Stack
         if: always()
         run: docker-compose -f docker-compose.yml down --volumes
+
+  feature-flag-validation:
+    name: Feature Flag Validation
+    runs-on: ubuntu-latest
+    needs: docker-build-and-integration
+    if: always()
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate Feature Flags
+        run: |
+          echo "🔍 Validating feature flags exist in Unleash..."
+          
+          # Start just Unleash and PostgreSQL for validation
+          docker-compose -f docker-compose.yml up -d postgres unleash-server
+          
+          # Wait for Unleash
+          for i in {1..30}; do
+            if curl -s http://localhost:4242/health > /dev/null; then
+              echo "✅ Unleash is ready"
+              break
+            fi
+            sleep 5
+          done
+          
+          # Initialize flags
+          chmod +x ./scripts/init-flags.sh
+          ./scripts/init-flags.sh
+          
+          # Verify flags exist
+          FLAGS_RESPONSE=$(curl -s -X GET "http://localhost:4242/api/admin/projects/default/features" \
+            -H "Authorization: $ADMIN_TOKEN")
+          
+          for flag in premium-pricing order-notifications bulk-order-discount; do
+            if echo "$FLAGS_RESPONSE" | grep -q "$flag"; then
+              echo "✅ $flag exists"
+            else
+              echo "❌ $flag not found"
+              exit 1
+            fi
+          done
+          
+          docker-compose -f docker-compose.yml down --volumes
