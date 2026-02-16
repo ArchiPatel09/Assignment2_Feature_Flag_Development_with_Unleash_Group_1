@@ -1,0 +1,272 @@
+name: CI/CD Pipeline with Feature Flags
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  # Job 1: Build & Test
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build and Test Product Service
+        run: |
+          cd product-service
+          mvn clean test
+          mvn package -DskipTests
+
+      - name: Build and Test Order Service
+        run: |
+          cd order-service
+          mvn clean test
+          mvn package -DskipTests
+
+      - name: Upload Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+
+  # Job 2: Docker Build & Integration Test
+  docker-integration-test:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Docker Compose
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker-compose curl jq
+
+      - name: Build Docker images
+        run: docker-compose build
+
+      - name: Start services
+        run: docker-compose up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for services to be healthy..."
+          sleep 30
+          
+          # Check each service health
+          for service in postgres unleash-server product-service order-service; do
+            echo "Checking $service..."
+            for i in {1..30}; do
+              if docker inspect --format='{{.State.Health.Status}}' $service | grep -q "healthy"; then
+                echo "✅ $service is healthy"
+                break
+              fi
+              if [ $i -eq 30 ]; then
+                echo "❌ $service failed to become healthy"
+                docker logs $service
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+
+      - name: Initialize feature flags
+        run: |
+          chmod +x scripts/init-flags.sh
+          ./scripts/init-flags.sh
+
+      - name: Integration Tests
+        run: |
+          echo "🔬 Running Integration Tests..."
+          
+          # Test 1: Create a product
+          echo "Creating test product..."
+          PRODUCT_RESPONSE=$(curl -s -X POST http://localhost:8081/api/products \
+            -H "Content-Type: application/json" \
+            -d '{"name": "Test Product", "price": 100.00, "quantity": 50}')
+          
+          PRODUCT_ID=$(echo $PRODUCT_RESPONSE | jq -r '.id')
+          echo "Product created with ID: $PRODUCT_ID"
+          
+          # Test 2: Test premium pricing flag
+          echo -e "\n🧪 Testing premium-pricing flag..."
+          
+          # Get regular products
+          REGULAR_PRICE=$(curl -s http://localhost:8081/api/products | jq '.[0].price')
+          
+          # Get premium products (with discount if flag enabled)
+          PREMIUM_PRICE=$(curl -s http://localhost:8081/api/products/premium | jq '.[0].price')
+          
+          if (( $(echo "$PREMIUM_PRICE < $REGULAR_PRICE" | bc -l) )); then
+            echo "✅ premium-pricing flag is working (discount applied)"
+          else
+            echo "❌ premium-pricing flag test failed"
+            exit 1
+          fi
+          
+          # Test 3: Test bulk-order-discount flag
+          echo -e "\n🧪 Testing bulk-order-discount flag..."
+          
+          # Create order with quantity > 5 (should get discount)
+          ORDER_RESPONSE=$(curl -s -X POST http://localhost:8082/api/orders \
+            -H "Content-Type: application/json" \
+            -d "{\"productId\": $PRODUCT_ID, \"quantity\": 10, \"status\": \"PENDING\"}")
+          
+          ORDER_TOTAL=$(echo $ORDER_RESPONSE | jq '.totalPrice')
+          EXPECTED_DISCOUNTED=$(echo "100 * 10 * 0.85" | bc)
+          
+          if (( $(echo "$ORDER_TOTAL == $EXPECTED_DISCOUNTED" | bc -l) )); then
+            echo "✅ bulk-order-discount flag is working (discount applied)"
+          else
+            echo "❌ bulk-order-discount flag test failed"
+            exit 1
+          fi
+          
+          # Test 4: Toggle flag via API and verify behavior changes
+          echo -e "\n🧪 Testing flag toggle behavior..."
+          
+          # Disable premium-pricing flag
+          curl -s -X POST "http://localhost:4242/api/admin/projects/default/features/premium-pricing/environments/development/off" \
+            -H "Authorization: default:development.unleash-default-token"
+          
+          sleep 2
+          
+          # Check if discount is removed
+          NEW_PREMIUM_PRICE=$(curl -s http://localhost:8081/api/products/premium | jq '.[0].price')
+          
+          if (( $(echo "$NEW_PREMIUM_PRICE == $REGULAR_PRICE" | bc -l) )); then
+            echo "✅ Flag toggle is working (discount removed after disabling)"
+          else
+            echo "❌ Flag toggle test failed"
+            exit 1
+          fi
+          
+          echo -e "\n✅ All integration tests passed!"
+
+      - name: Show Docker logs
+        if: always()
+        run: docker-compose logs --tail=50
+
+      - name: Stop services
+        if: always()
+        run: docker-compose down
+
+  # Job 3: Feature Flag Validation
+  feature-flag-validation:
+    runs-on: ubuntu-latest
+    needs: docker-integration-test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install curl and jq
+        run: sudo apt-get install -y curl jq
+
+      - name: Start Unleash and PostgreSQL
+        run: |
+          docker-compose up -d postgres unleash-server
+          sleep 30
+
+      - name: Initialize and validate feature flags
+        run: |
+          chmod +x scripts/init-flags.sh
+          ./scripts/init-flags.sh
+          
+          echo -e "\n🔍 Validating feature flags..."
+          
+          # Get all flags
+          FLAGS=$(curl -s -H "Authorization: default:development.unleash-default-token" \
+            http://localhost:4242/api/admin/projects/default/features)
+          
+          # Check for premium-pricing flag
+          if echo "$FLAGS" | jq -e '.features[] | select(.name == "premium-pricing")' > /dev/null; then
+            echo "✅ premium-pricing flag exists"
+          else
+            echo "❌ premium-pricing flag not found"
+            exit 1
+          fi
+          
+          # Check for order-notifications flag
+          if echo "$FLAGS" | jq -e '.features[] | select(.name == "order-notifications")' > /dev/null; then
+            echo "✅ order-notifications flag exists"
+          else
+            echo "❌ order-notifications flag not found"
+            exit 1
+          fi
+          
+          # Check for bulk-order-discount flag
+          if echo "$FLAGS" | jq -e '.features[] | select(.name == "bulk-order-discount")' > /dev/null; then
+            echo "✅ bulk-order-discount flag exists"
+          else
+            echo "❌ bulk-order-discount flag not found"
+            exit 1
+          fi
+          
+          echo -e "\n✅ All feature flags validated successfully!"
+
+      - name: Cleanup
+        if: always()
+        run: docker-compose down
+
+  # Bonus: Code Quality Job (Optional)
+  code-quality:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'pull_request'  # Only run on PRs
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Run code quality checks on Product Service
+        run: |
+          cd product-service
+          mvn checkstyle:check || true
+          mvn pmd:check || true
+          mvn spotbugs:check || true
+
+      - name: Run code quality checks on Order Service
+        run: |
+          cd order-service
+          mvn checkstyle:check || true
+          mvn pmd:check || true
+          mvn spotbugs:check || true
+
+      - name: Generate coverage report
+        run: |
+          cd product-service
+          mvn jacoco:report
+          cd ../order-service
+          mvn jacoco:report
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            **/target/site/jacoco/
