@@ -1,170 +1,117 @@
-name: PROG3360 Assignment Two CI/CD
+version: '3.8'
 
-on:
-  push:
-    branches:
-      - main
-  pull_request:
+services:
+  # PostgreSQL for Unleash
+  postgres:
+    image: postgres:15-alpine
+    container_name: unleash-postgres
+    environment:
+      POSTGRES_DB: unleash
+      POSTGRES_USER: unleash_user
+      POSTGRES_PASSWORD: unleash_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U unleash_user -d unleash"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
 
-env:
-  ADMIN_TOKEN: unleash4all
+  # Unleash Feature Flag Server
+  unleash-server:
+    image: unleashorg/unleash-server:latest
+    container_name: unleash-server
+    ports:
+      - "4242:4242"
+    environment:
+      DATABASE_URL: postgres://unleash_user:unleash_password@postgres:5432/unleash
+      DATABASE_SSL: "false"
+      INIT_ADMIN_API_TOKENS: "*:*.unleash-default-token"
+      INIT_FRONTEND_API_TOKENS: "default:development.unleash-default-token"
+      INIT_ADMIN_USERNAME: admin
+      INIT_ADMIN_PASSWORD: unleash4all
+      LOG_LEVEL: debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:4242/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
 
-jobs:
-  build-and-test:
-    name: Build & Unit Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+  # Product Service
+  product-service:
+    build:
+      context: ./product-service
+      dockerfile: Dockerfile
+    container_name: product-service
+    ports:
+      - "8081:8081"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - SERVER_PORT=8081
+      - UNLEASH_API_URL=http://unleash-server:4242/api
+      - UNLEASH_API_TOKEN=default:development.unleash-default-token
+      - UNLEASH_APP_NAME=product-service
+      - UNLEASH_ENVIRONMENT=development
+    depends_on:
+      unleash-server:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 45s
+    restart: unless-stopped
+  # Order Service
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: order-service
+    ports:
+      - "8082:8082"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - SERVER_PORT=8082
+      - PRODUCT_SERVICE_URL=http://product-service:8081
+      - UNLEASH_API_URL=http://unleash-server:4242/api
+      - UNLEASH_API_TOKEN=default:development.unleash-default-token
+      - UNLEASH_APP_NAME=order-service
+      - UNLEASH_ENVIRONMENT=development
+    depends_on:
+      product-service:
+        condition: service_healthy
+      unleash-server:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v3
-        with:
-          distribution: temurin
-          java-version: 21
+volumes:
+  postgres_data:
+    driver: local
 
-      - name: Build Product Service
-        run: |
-          cd product-service
-          mvn clean test
-        continue-on-error: false
-
-      - name: Build Order Service
-        run: |
-          cd order-service
-          mvn clean test
-        continue-on-error: false
-
-      - name: Upload Unit Test Reports
-        uses: actions/upload-artifact@v3
-        with:
-          name: unit-test-reports
-          path: |
-            product-service/target/surefire-reports/
-            order-service/target/surefire-reports/
-
-  docker-build-and-integration:
-    name: Docker Build & Integration Test
-    runs-on: ubuntu-latest
-    needs: build-and-test
-    services:
-      docker:
-        image: docker:24-dind
-        privileged: true
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
-
-      - name: Set up Docker Compose
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and Start Docker Stack
-        run: |
-          docker-compose -f docker-compose.yml up -d --build
-
-      - name: Wait for PostgreSQL
-        run: |
-          until docker exec unleash-postgres pg_isready -U unleash_user; do
-            echo "Waiting for Postgres..."
-            sleep 5
-          done
-
-      - name: Wait for Unleash Server
-        run: |
-          until curl -s http://localhost:4242/health; do
-            echo "Waiting for Unleash..."
-            sleep 5
-          done
-
-      - name: Wait for Product Service
-        run: |
-          until curl -s http://localhost:8081/actuator/health; do
-            echo "Waiting for Product Service..."
-            sleep 5
-          done
-
-      - name: Wait for Order Service
-        run: |
-          until curl -s http://localhost:8082/actuator/health; do
-            echo "Waiting for Order Service..."
-            sleep 5
-          done
-
-      - name: Initialize Feature Flags
-        run: |
-          bash ./scripts/init-flags.sh
-
-      - name: Integration Test - Premium Pricing
-        run: |
-          # Turn ON premium-pricing flag
-          curl -X POST "http://localhost:4242/api/admin/projects/default/features/premium-pricing/environments/development/on" \
-            -H "Authorization: Bearer $ADMIN_TOKEN"
-          # Test endpoint
-          RESPONSE=$(curl -s http://localhost:8081/api/products/premium)
-          echo "Premium Products Response: $RESPONSE"
-          if [[ "$RESPONSE" != *"discount"* ]]; then
-            echo "Premium pricing feature flag test failed"
-            exit 1
-          fi
-
-      - name: Integration Test - Order Notifications
-        run: |
-          # Turn ON order-notifications flag
-          curl -X POST "http://localhost:4242/api/admin/projects/default/features/order-notifications/environments/development/on" \
-            -H "Authorization: Bearer $ADMIN_TOKEN"
-          # Create order and check logs
-          ORDER_ID=$(curl -s -X POST http://localhost:8082/api/orders \
-            -H "Content-Type: application/json" \
-            -d '{"productId":1,"quantity":1}' | jq -r '.id')
-          LOG_OUTPUT=$(docker logs order-service)
-          echo "Order Service Logs: $LOG_OUTPUT"
-          if [[ "$LOG_OUTPUT" != *"$ORDER_ID"* ]]; then
-            echo "Order notification feature flag test failed"
-            exit 1
-          fi
-
-      - name: Integration Test - Bulk Order Discount
-        run: |
-          # Turn ON bulk-order-discount flag
-          curl -X POST "http://localhost:4242/api/admin/projects/default/features/bulk-order-discount/environments/development/on" \
-            -H "Authorization: Bearer $ADMIN_TOKEN"
-          # Create bulk order
-          RESPONSE=$(curl -s -X POST http://localhost:8082/api/orders \
-            -H "Content-Type: application/json" \
-            -d '{"productId":1,"quantity":6}' )
-          TOTAL=$(echo "$RESPONSE" | jq '.totalPrice')
-          echo "Bulk Order Total: $TOTAL"
-          if (( $(echo "$TOTAL >= 1" | bc -l) )); then
-            echo "Bulk order discount test passed (verify manually in service)"
-          fi
-
-      - name: Tear down Docker Stack
-        run: docker-compose -f docker-compose.yml down --volumes
-
-  feature-flag-validation:
-    name: Feature Flag Validation
-    runs-on: ubuntu-latest
-    needs: docker-build-and-integration
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
-
-      - name: Verify Feature Flags Exist
-        run: |
-          FLAGS=$(curl -s http://localhost:4242/api/admin/projects/default/features \
-            -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.features[].name')
-          echo "Existing Flags: $FLAGS"
-          for flag in premium-pricing order-notifications bulk-order-discount; do
-            if ! echo "$FLAGS" | grep -q "$flag"; then
-              echo "Flag $flag does not exist!"
-              exit 1
-            fi
-          done
-
-      - name: Test Fallback Behavior
-        run: |
-          # Simulate non-existing flag
-          RESPONSE=$(curl -s http://localhost:8081/api/products/premium)
-          echo "Fallback Response: $RESPONSE"
-          # Check the application returns default behavior
+networks:
+  ecommerce-network:
+    driver: bridge
