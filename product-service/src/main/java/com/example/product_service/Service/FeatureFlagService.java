@@ -6,12 +6,15 @@ import org.springframework.stereotype.Service;
 @Service
 public class FeatureFlagService {
 
+    // injecting unleash client
     private final Unleash unleash;
 
+    // constructor
     public FeatureFlagService(Unleash unleash) {
         this.unleash = unleash;
     }
 
+    // checking whether the 'premium-pricing' feature flag is enabled
     public boolean isPremiumPricingEnabled() {
         try {
             return unleash.isEnabled("premium-pricing", false);
@@ -21,6 +24,7 @@ public class FeatureFlagService {
         }
     }
 
+    // applying premium-pricing logic if the feature flag is enabled
     public double applyPremiumPricing(double originalPrice) {
         if (isPremiumPricingEnabled()) {
             return originalPrice * 0.9;

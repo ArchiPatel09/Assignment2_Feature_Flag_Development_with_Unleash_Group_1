@@ -42,7 +42,6 @@ class OrderControllerTest {
         mockMvc = MockMvcBuilders.standaloneSetup(orderController).build();
         objectMapper = new ObjectMapper();
 
-        // FIX: Set IDs properly when creating orders
         Order order1 = new Order(1L, 5, 500.0, "PENDING");
         order1.setId(1L);
 

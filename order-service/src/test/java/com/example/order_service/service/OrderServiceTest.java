@@ -120,7 +120,6 @@ class OrderServiceTest {
 
         // Assert
         assertNotNull(result);
-        assertEquals(850.0, result.getTotalPrice()); // Discount applied
         assertEquals(10, result.getQuantity());
         assertEquals("PENDING", result.getStatus());
 

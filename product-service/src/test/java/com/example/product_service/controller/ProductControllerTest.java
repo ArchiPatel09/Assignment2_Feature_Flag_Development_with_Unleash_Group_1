@@ -114,7 +114,7 @@ class ProductControllerTest {
         // Arrange
         when(productService.getAllProducts()).thenReturn(testProducts);
 
-        // Mock the applyPremiumPricing method directly since that's what controller calls
+
         when(featureFlagService.applyPremiumPricing(1000.0)).thenReturn(900.0);
         when(featureFlagService.applyPremiumPricing(50.0)).thenReturn(45.0);
         when(featureFlagService.applyPremiumPricing(80.0)).thenReturn(72.0);
@@ -140,7 +140,6 @@ class ProductControllerTest {
         // Arrange
         when(productService.getAllProducts()).thenReturn(testProducts);
 
-        // When flag is disabled, applyPremiumPricing returns original price
         when(featureFlagService.applyPremiumPricing(1000.0)).thenReturn(1000.0);
         when(featureFlagService.applyPremiumPricing(50.0)).thenReturn(50.0);
         when(featureFlagService.applyPremiumPricing(80.0)).thenReturn(80.0);

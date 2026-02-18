@@ -31,12 +31,12 @@ public class ProductController {
         return service.getProductById(id);
     }
 
-    // NEW: premium endpoint with discounted prices
+    // premium endpoint with discounted prices
     @GetMapping("/premium")
     public List<Product> getPremiumProducts() {
         List<Product> products = service.getAllProducts();
 
-        // Apply discount if flag is enabled
+        // applying discount if flag is enabled
         return products.stream()
                 .map(product -> {
                     Product discountedProduct = new Product(

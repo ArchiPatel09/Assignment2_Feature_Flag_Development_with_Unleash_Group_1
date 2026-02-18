@@ -17,10 +17,14 @@ public class OrderService {
 
     private static final Logger logger = LoggerFactory.getLogger(OrderService.class);
 
+    // repository for database operations
     private final OrderRepository repository;
+    // feign client for communicating with product service
     private final ProductServiceClient productServiceClient;
+    // feature  flag service for conditional business logic
     private final FeatureFlagService featureFlagService;
 
+    // constructor
     public OrderService(OrderRepository repository,
                         ProductServiceClient productServiceClient,
                         FeatureFlagService featureFlagService) {
@@ -29,14 +33,17 @@ public class OrderService {
         this.featureFlagService = featureFlagService;
     }
 
+    // retrieving all orders
     public List<Order> getAllOrders() {
         return repository.findAll();
     }
 
+    // retrieving a single order by id
     public Order getOrderById(Long id) {
         return repository.findById(id).orElse(null);
     }
 
+    // creating a new order
     @Transactional
     public Order createOrder(OrderRequest orderRequest) {
         ProductDto product = productServiceClient.getProductById(orderRequest.getProductId());
@@ -56,6 +63,7 @@ public class OrderService {
                 orderRequest.getQuantity()
         );
 
+        // creating order entity
         Order order = new Order(
                 orderRequest.getProductId(),
                 orderRequest.getQuantity(),
@@ -65,6 +73,7 @@ public class OrderService {
 
         Order savedOrder = repository.save(order);
 
+        // conditionally log notification
         featureFlagService.logOrderNotification(
                 savedOrder.getId(),
                 savedOrder.getProductId(),

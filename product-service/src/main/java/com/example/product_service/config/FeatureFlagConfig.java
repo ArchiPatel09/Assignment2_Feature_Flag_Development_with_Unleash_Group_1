@@ -10,18 +10,23 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 public class FeatureFlagConfig {
 
+    // application name
     @Value("${unleash.app-name:product-service}")
     private String appName;
 
+    // identifier
     @Value("${unleash.instance-id:${HOSTNAME:local}}")
     private String instanceId;
 
+    // runtime environment
     @Value("${unleash.environment:development}")
     private String environment;
 
+    // api base url
     @Value("${unleash.api-url:http://localhost:4242/api}")
     private String apiUrl;
 
+    // creating and configuring client bean
     @Bean
     public Unleash unleash() {
         UnleashConfig config = UnleashConfig.builder()

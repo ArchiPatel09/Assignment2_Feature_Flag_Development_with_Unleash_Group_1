@@ -123,7 +123,6 @@ class FeatureFlagServiceTest {
         assertEquals(500.0, featureFlagService.applyBulkDiscount(500.0, 5), 0.01); // edge case - exactly 5
     }
 
-    // Order Notifications Flag Tests
     @Test
     void isOrderNotificationsEnabled_WhenFlagOn_ReturnsTrue() {
         // Arrange
@@ -167,9 +166,6 @@ class FeatureFlagServiceTest {
     void logOrderNotification_WhenFlagEnabled_LogsNotification() {
         // Arrange
         when(unleash.isEnabled(eq("order-notifications"), anyBoolean())).thenReturn(true);
-
-        // We can't easily verify logger output in unit test without more setup
-        // This test just ensures no exception is thrown
 
         // Act & Assert
         assertDoesNotThrow(() ->

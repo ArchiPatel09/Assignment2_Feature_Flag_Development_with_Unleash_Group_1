@@ -1,7 +1,6 @@
 version: '3.8'
 
 services:
-  # PostgreSQL for Unleash
   postgres:
     image: postgres:15-alpine
     container_name: unleash-postgres
@@ -23,7 +22,6 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  # Unleash Feature Flag Server
   unleash-server:
     image: unleashorg/unleash-server:latest
     container_name: unleash-server
@@ -50,7 +48,6 @@ services:
       start_period: 30s
     restart: unless-stopped
 
-  # Product Service
   product-service:
     build:
       context: ./product-service
@@ -77,7 +74,7 @@ services:
       retries: 15
       start_period: 45s
     restart: unless-stopped
-  # Order Service
+
   order-service:
     build:
       context: ./order-service
